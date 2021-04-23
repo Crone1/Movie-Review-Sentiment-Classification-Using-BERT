@@ -1,6 +1,6 @@
 # Overview
 
-This repository contains my submission for assignment 2 in the module 'Natural Language Processing'.
+This repository contains my submission for assignment 3 in the module 'Natural Language Processing'.
 This project looks at movie review sentiment classification using a BERT transformer and attempts to analyse the differences this model has when compared to more traditional machine learning models such as Multinomial Naive Bayes and Logistic Regression.
 
 # File Description
