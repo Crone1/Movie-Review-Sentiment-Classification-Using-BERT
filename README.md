@@ -1,7 +1,8 @@
 # Overview
 
 This repository contains my submission for assignment 3 in the module 'Natural Language Processing'.
-This project looks at movie review sentiment classification using a BERT transformer and attempts to analyse the differences this model has when compared to more traditional machine learning models such as Multinomial Naive Bayes and Logistic Regression.
+This project looks at movie review sentiment classification using a BERT transformer and attempts to compare this model to more traditional machine learning models, such as Multinomial Naive Bayes and Logistic Regression.
+This project looks at the strengths and weaknesses of these models along with their similarities and their differences.
 
 # File Description
 
@@ -16,7 +17,7 @@ While the data in this folder is in '.tar' format, this is handled in the notebo
 My code for this analysis was written in Python and is made up of four main files.
 These are:
 
-1. *'bert_movie_sentiment_analysis'*
+1. *'bert_movie_sentiment_analysis.ipynb'*
    * This is the notebook used to carry out this analysis.
    * This notebook calls from all of the other '.py' files which executing.
 
