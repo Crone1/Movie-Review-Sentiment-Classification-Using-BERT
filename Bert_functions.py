@@ -5,6 +5,7 @@
 # =====================
 
 # general packages
+import time
 import pandas as pd
 from tqdm.auto import tqdm
 import os
@@ -27,6 +28,7 @@ import logging as log
 from torchnlp.utils import lengths_to_mask
 from collections import OrderedDict
 from torch import optim
+import numpy
 
 # packages for training the classifier
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -34,6 +36,10 @@ from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 
 # packages for plotting
 import matplotlib.pyplot as plt
+
+# packages for clearing CUDA cache
+import gc
+import torch
 
 
 # =================================
@@ -525,9 +531,21 @@ class Classifier(pl.LightningModule):
         if type(hyper_params) is dict:
             hyper_params = pl.utilities.AttributeDict(hyper_params)
 
-        self.global_batch_size = hyper_params["batch_size"]
-        self.model_name = kwargs["model_name"]
-        del kwargs["model_name"]
+        # TODO: THIS WAS A QUICK FIX - THESE VARIABLES SHOULD BE PASSED INTO THE CLASS
+        self.model_name = 'distilbert-base-uncased'
+        self.global_batch_size = 10
+
+        '''
+        if hyper_params:
+            self.global_batch_size = hyper_params.batch_size
+        else:
+            self.global_batch_size = kwargs["batch_size"]
+            del kwargs["batch_size"]
+
+        if "model_name" in kwargs:
+            self.model_name = kwargs["model_name"]
+            del kwargs["model_name"]
+        '''
         self.hparams = hyper_params
         self.batch_size = hyper_params.batch_size
         self.data = SlicedDataModule(self, self.global_batch_size, **kwargs)
@@ -613,7 +631,7 @@ class Classifier(pl.LightningModule):
 
         # Run BERT model.
         word_embeddings = self.bert(tokens, mask).last_hidden_state
-        sentence_embedding = word_embeddings[:,0]  # at position of [CLS]
+        sentence_embedding = word_embeddings[:, 0]  # at position of [CLS]
         logits = self.classification_head(sentence_embedding)
 
         # Hack to conveniently use the model and trainer to get predictions for a test set:
@@ -815,7 +833,7 @@ def define_classifier_and_trainer_for_each_cv_fold(train_test_splits, classifier
     for cv_data_split in tqdm(train_test_splits):
         # create the classifier for this cv fold
         classifier = Classifier(hyper_params=classifier_params,
-                                model_name=predefined_variables["model_name"],
+                                # TEMPORARY BIG FIX model_name=predefined_variables["model_name"],
                                 # parameters for SlicedDataModule:
                                 data_split=cv_data_split,
                                 # parameters for SlicedDocument():
@@ -829,18 +847,17 @@ def define_classifier_and_trainer_for_each_cv_fold(train_test_splits, classifier
         classifiers_list.append(classifier)
 
     # Set the model up so that it stops running if there is no improvement in accuracy
-    # https://pytorch-lightning.readthedocs.io/en/latest/common/early_stopping.html
     early_stop_callback = EarlyStopping(monitor='val_acc', min_delta=model_params["min_early_stopping_delta"],
                                         patience=model_params["model_patience"], verbose=False, mode='max')
 
     # Define a training framework for each of these classifiers
     print("Defining the trainers for each CV fold:")
-    trainers_list, modeL_callbacks = [], []
-    for cv_num, classifier in tqdm(enumerate(classifiers_list)):
+    trainers_list, modeL_callbacks_list = [], []
+    for fold_num, classifier in tqdm(enumerate(classifiers_list)):
 
         # Set the model up so that the model is saved at checkpoints when its accuracy improves
         save_top_model_callback = ModelCheckpoint(save_top_k=3, monitor='val_acc', mode='max',
-                                                  filename='cv{cv_num}-{val_acc:.4f}-{epoch:02d}-{val_loss:.4f}')
+                                                  filename='{fold_num}-{val_acc:.4f}-{epoch:02d}-{val_loss:.4f}')
 
         # define the trainer
         trainer = pl.Trainer(callbacks=[early_stop_callback, save_top_model_callback],
@@ -854,42 +871,116 @@ def define_classifier_and_trainer_for_each_cv_fold(train_test_splits, classifier
                              logger=pl.loggers.TensorBoardLogger(os.path.abspath('lightning_logs')),
                              )
         # add this model callback & trainer to a list of other callbacks & trainers
-        modeL_callbacks.append(save_top_model_callback)
+        modeL_callbacks_list.append(save_top_model_callback)
         trainers_list.append(trainer)
 
-    return classifiers_list, trainers_list, modeL_callbacks
+    return classifiers_list, trainers_list, modeL_callbacks_list
+
+
+# ===============================
+# |  TRAIN THE BERT CLASSIFIERS  |
+# ================================
+
+def train_classifiers(model_name, classifiers_list, trainers_list, modeL_callbacks_list):
+
+    # set up the dataframe we output with the evaluation summary statistics
+    bert_fold_eval_df = pd.DataFrame(columns=['fold_no', 'fold_time', 'fold_val_accuracy', 'fold_test_accuracy', 'fold_test_loss'],
+                                     index=range(len(classifiers_list)))
+
+    fold_val_accuracies, fold_test_accuracies, fold_test_loss = [], [], []
+    eval_start = time.time()
+    for i, (classifier, trainer, save_top_model_callback) in tqdm(enumerate(zip(classifiers_list, trainers_list, modeL_callbacks_list))):
+        iteration_start = time.time()
+
+        # fit the model to the data
+        trainer.fit(classifier, classifier.data)
+
+        # get the time this training took
+        iteration_duration = time.time() - iteration_start
+
+        # get an accuracy score for the trained model
+        best_val_accuracy = save_top_model_callback.best_model_score.item()
+        fold_val_accuracies.append(best_val_accuracy)
+
+        # test the model and gets its test accuracy & test loss
+        test_results = trainer.test(verbose=False)
+        test_accuracy = test_results[0]["test_acc"]
+        test_loss = test_results[0]["test_loss"]
+        fold_test_accuracies.append(test_accuracy)
+        fold_test_loss.append(test_loss)
+
+        # add the results from this fold to the fold evaluation dataframe
+        bert_fold_eval_df.loc[i, 'fold_no'] = i + 1
+        bert_fold_eval_df.loc[i, 'fold_time'] = iteration_duration
+        bert_fold_eval_df.loc[i, 'fold_validation_accuracy'] = best_val_accuracy
+        bert_fold_eval_df.loc[i, 'fold_test_accuracy'] = test_accuracy
+        bert_fold_eval_df.loc[i, 'fold_test_loss'] = test_loss
+
+        # collect the garbage & empty the cuda memory
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # time the duration of the evaluation
+    bert_eval_duration = time.time() - eval_start
+
+    # create the evaluation summary statistics for this model
+    n_test = float(len(fold_test_accuracies))
+    avg_test = sum(fold_test_accuracies) / n_test
+    variance_test = sum([(x - avg_test) ** 2 for x in fold_test_accuracies]) / n_test
+    n_val = float(len(fold_val_accuracies))
+    avg_val = sum(fold_val_accuracies) / n_val
+    variance_val = sum([(x - avg_val) ** 2 for x in fold_val_accuracies]) / n_val
+
+    # create a dataframe with one row summarising the model evaluation
+    bert_eval_values = {'Full Name': model_name,
+                        'Avg Test Accuracy': avg_test,
+                        'Avg Val Accuracy': avg_val,
+                        'Test Accuracy Std Dev': variance_test**0.5,
+                        'Val Accuracy Std Dev': variance_val**0.5,
+                        'Min Test Accuracy': min(fold_test_accuracies),
+                        'Max Test Accuracy': max(fold_test_accuracies),
+                        'Min Val Accuracy': min(fold_val_accuracies),
+                        'Max Val Accuracy': max(fold_val_accuracies),
+                        'Total Time (s)': round(bert_eval_duration, 2),
+                        'All Fold Test Accuracies': str([round(a, 3) for a in fold_test_accuracies]),
+                        'All Fold Val Accuracies': str([round(a, 3) for a in fold_val_accuracies]),
+                        }
+
+    return pd.DataFrame(bert_eval_values, index=[0]), bert_fold_eval_df
 
 
 # =========================
 # |  EVALUATE THE MODELS  |
 # =========================
 
-def plot_fold_eval_scores(fold_eval_df):
+def plot_each_models_evaluation_metrics(nb_fold_eval_df, lr_fold_eval_df, bert_fold_eval_df):
 
-    """
-    Create a plot of the evaluation scores and the time for each cross validation fold during the model training and evaluation process for a specific model
-
-    Params:
-        fold_eval_df: dataframe - a dataframe containing a row for each fold tested and then a column for the time taken and the accuracy score achived
-
-    Returns:
-        None
-    """
-
-    fig, (axes1, axes2, axes3) = plt.subplots(figsize=(16, 12), nrows=3, ncols=1, sharex=True)
+    fig, (axes1, axes2, axes3) = plt.subplots(figsize=(16, 12), nrows=3, sharex=True)
 
     # set the axes names
-    axes1.set_ylabel('Time (s)')
-    axes2.set_ylabel('Val Accuracy')
-    axes3.set_ylabel('Test Accuracy & Loss')
+    axes1.set_ylabel('Fold Time (s)')
+    axes2.set_ylabel('Fold Test Accuracy')
+    axes3.set_ylabel('Fold Validation Accuracy')
     axes3.set_xlabel('Fold No.')
 
-    # plot the evaluation scores
-    axes1.plot(fold_eval_df['fold_no'], fold_eval_df['fold_time'])
-    axes2.plot(fold_eval_df['fold_no'], fold_eval_df['fold_validation_accuracy'])
-    axes3.plot(fold_eval_df['fold_no'], fold_eval_df['fold_test_accuracy'])
-    axes3.plot(fold_eval_df['fold_no'], fold_eval_df['fold_test_loss'])
-    #plt.subplots_adjust(hspace=0.5)
+    # plot the fold times of each model
+    axes1.plot(nb_fold_eval_df['fold_no'], nb_fold_eval_df['fold_time'], label="Naive Bayes")
+    axes1.plot(lr_fold_eval_df['fold_no'], lr_fold_eval_df['fold_time'], label="Logistic Reg")
+    axes1.plot(bert_fold_eval_df['fold_no'], bert_fold_eval_df['fold_time'], label="BERT")
+    axes1.legend()
+
+    # plot the fold test accuracy scores for each model
+    axes2.plot(nb_fold_eval_df['fold_no'], nb_fold_eval_df['fold_accuracy'], label="Naive Bayes")
+    axes2.plot(lr_fold_eval_df['fold_no'], lr_fold_eval_df['fold_accuracy'], label="Logistic Reg")
+    axes2.plot(bert_fold_eval_df['fold_no'], bert_fold_eval_df['fold_test_accuracy'], label="BERT")
+    axes2.legend()
+
+    # plot the fold validation accuracy score for the BERT model
+    axes3.plot(bert_fold_eval_df['fold_no'], bert_fold_eval_df['fold_validation_accuracy'], label="Validation")
+    axes3.plot(bert_fold_eval_df['fold_no'], bert_fold_eval_df['fold_test_accuracy'], label="Test")
+    axes3.legend()
+
+    # show the plots
     plt.show()
 
 
@@ -897,13 +988,13 @@ def plot_fold_eval_scores(fold_eval_df):
 # |  SAVE THE BEST TRAINED MODEL  |
 # =================================
 
-def save_best_model(classifier, trainer, fold_num):
+def save_best_model(model_name, batch_size, best_model_path, fold_num):
 
     # Explicitly load the classifiers best checkpoint - batch size was saved in the checkpoint automatically
-    best_model = Classifier.load_from_checkpoint(checkpoint_path=trainer.checkpoint_callback.best_model_path)
+    best_model = Classifier.load_from_checkpoint(checkpoint_path=best_model_path)
 
     # Wrap the model into a new trainer to be able to save a checkpoint
-    new_trainer = pl.Trainer(resume_from_checkpoint=trainer.checkpoint_callback.best_model_path,
+    new_trainer = pl.Trainer(resume_from_checkpoint=best_model_path,
                              gpus=-1,  # avoid warnings (-1 = automatic selection)
                              logger=pl.loggers.TensorBoardLogger(os.path.abspath('lightning_logs')),
                              )
@@ -922,24 +1013,89 @@ def save_best_model(classifier, trainer, fold_num):
     new_trainer.save_checkpoint("fold-{}-best-model-weights-only.ckpt".format(fold_num), True)
 
     # this version saves the bert model in pytorch format and without the classification head
-    best_model.bert.save_pretrained('fold-{}-best-bert-encoder.pt'.format(fold_nu))
+    best_model.bert.save_pretrained('fold-{}-best-bert-encoder.pt'.format(fold_num))
 
     # this version saves the full network in pytorch format - can be done since the lightning module inherits from pytorch
     torch.save(best_model.state_dict(), 'fold-{}-best-model.pt'.format(fold_num))
+
+
+# ====================================
+# |  LOAD IN THE BEST TRAINED MODEL  |
+# ====================================
+
+def load_best_model(tokeniser, fold_num):
+
+    # load the models weights only
+    best_model = Classifier.load_from_checkpoint(checkpoint_path='fold-{}-best-model-weights-only.ckpt'.format(fold_num))
+
+    # put the model into prediction mode - turn off dropout
+    best_model.eval()
+
+    # ensure the model has a tokeniser associated with it
+    if best_model.tokenizer is None:
+        best_model.tokenizer = tokeniser
+
+    return best_model
 
 
 # ===================================
 # |  ANALYSE THE MODELS PREDICTION  |
 # ===================================
 
-def test_model_and_get_results(model, test_dataset):
+def test_best_model_on_test_data(new_trainer, tokeniser, max_sequence_length, start_end_fraction, best_model, test_data):
 
-    # define a dataframe to house the datas predictions
-    prediction_df = pd.DataFrame(columns=['index', 'real_class', 'predicted_class', 'correct'], index=list(range(len(test_dataset))))
+    # start recording the models predictions
+    best_model.start_recording_predictions()
+
+    # Slice the test dataset into sequences less than or equal to the max length
+    sliced_test_dataset = SlicedDocuments(raw_data=test_data,
+                                          tokeniser=tokeniser,
+                                          fraction_for_first_sequence=start_end_fraction,
+                                          max_sequence_length=max_sequence_length,
+                                          second_part_as_sequence_B=False,
+                                          preproc_batch_size=8,
+                                         )
+
+    # Use the dataloader to create batches of data for the model
+    batched_data = DataLoader(dataset=sliced_test_dataset,
+                              batch_size=best_model.hparams.batch_size,
+                              collate_fn=best_model.prepare_sample,
+                              num_workers=best_model.hparams.loader_workers,
+                             )
+
+    # use the folds best model to predict a label for the documents in the test data
+    new_trainer.test(best_model, test_dataloaders=[batched_data])#, verbose=False)
+
+    # stop recording the models predictions
+    best_model.stop_recording_predictions()
+
+    return sliced_test_dataset
+
+
+def take_item_dict_and_turn_to_doc(item_dict):
+
+    # get the document parts from the item
+    parts = item_dict["parts"]
+
+    # Ensure each part is represented as a sentence
+    joined_parts = []
+    for part in parts:
+        joined_parts.append(" ".join(part))
+
+    # join the parts together
+    full_doc = "||".join(joined_parts)
+
+    return full_doc
+
+
+def get_models_prediction_results(model, test_dataset):
+
+    # define a dataframe to house the data's predictions
+    prediction_df = pd.DataFrame(columns=['index', 'real_class', 'predicted_class', 'correct', 'tested_document'], index=list(range(len(test_dataset))))
 
     # iterate through the test dataset and populate the dataframe with the predictions
     for i, item in enumerate(test_dataset):
-        
+
         # get the prediction key for this item
         input_token_ids = model.prepare_sample([item])[0]['input_ids']
         key = input_token_ids.tolist()[0]
@@ -958,10 +1114,34 @@ def test_model_and_get_results(model, test_dataset):
             prediction = 'unknown'
 
         # populate the dataframe
+        prediction_df.loc[i, "index"] = i
         prediction_df.loc[i, "real_class"] = item['label']
         prediction_df.loc[i, "predicted_class"] = prediction
         prediction_df.loc[i, "correct"] = "yes" if prediction == item['label'] else "no"
+        prediction_df.loc[i, "tested_document"] = take_item_dict_and_turn_to_doc(item)
 
     return prediction_df
 
 
+def get_correct_and_incorrect_predictions(fold_pred_df):
+
+    correct_pred_df = fold_pred_df[fold_pred_df['correct'] == 'yes'].reset_index(drop=True)
+    incorrect_pred_df = fold_pred_df[fold_pred_df['correct'] == 'no'].reset_index(drop=True)
+
+    # Print the breakdown of the correct/incorrect predictions
+    print("{}% of these documents are predicted correctly".format(round(len(correct_pred_df) / len(fold_pred_df) * 100), 2))
+    print("{}% of these documents are predicted incorrectly".format(round(len(incorrect_pred_df) / len(fold_pred_df) * 100), 2))
+
+    return correct_pred_df, incorrect_pred_df
+
+
+def get_pos_and_neg_docs(bert_fold_pred_df):
+
+    pos_docs = bert_fold_pred_df[bert_fold_pred_df['real_class'] == "pos"]
+    neg_docs = bert_fold_pred_df[bert_fold_pred_df['real_class'] == "neg"]
+
+    # Print the breakdown of the classes in these documents
+    print("{}% of these documents are positive".format(round(len(pos_docs) / len(bert_fold_pred_df) * 100), 2))
+    print("{}% of these documents are negative".format(round(len(neg_docs) / len(bert_fold_pred_df) * 100), 2))
+
+    return pos_docs, neg_docs
