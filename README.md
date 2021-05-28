@@ -1,16 +1,19 @@
 # Overview
+This repository contains the work I did in using a BERT transformer for classification of movie review sentiment.
+It also attempts to compare this transformer model to more traditional machine learning models looking at the strengths and weaknesses of these models along with their similarities and differences. This builds on from work I did in my repository on [movie sentiment analysis using sklearn models](https://github.com/Crone1/Movie-Review-Sentiment-Classification-Using-Sklearn).
+This project was completed as part of a college module 'Natural Language Technologies'.
 
-This repository contains my submission for assignment 3 in the module 'Natural Language Processing'.
-This project looks at movie review sentiment classification using a BERT transformer and attempts to compare this model to more traditional machine learning models, such as Multinomial Naive Bayes and Logistic Regression.
-This project looks at the strengths and weaknesses of these models along with their similarities and their differences.
 
 # File Description
 
-
 ### Data
 
-The data is contained in the *Data* folder.
-While the data in this folder is in '.tar' format, this is handled in the notebook and turned into a corpus of both positive and negative documents.
+The *'Data'* folder contains the original data used in this modelling process in '.tar' format.
+This is handled in the notebook and turned into a corpus of both positive and negative documents.
+If this *'Data'* folder is empty, the *'chromedriver.exe'* file is needed to scrape the data from the internet.
+This driver may be out of date depending on th version of google chrome you have installed.
+This issue can be solved by downloading the updated version of chromedriver that matches your version of chrome here.
+
 
 ### Code
 
